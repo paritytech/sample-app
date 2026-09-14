@@ -2,5 +2,5 @@
 
 Survey DApp is a decentralized survey app on Polkadot — create surveys, collect responses, and view aggregated results, all on-chain. (React + Vite + TypeScript). Full AI agent guidance is in `CLAUDE.md` at the repo root — read it before proposing changes.
 
-- Host API (`@parity/product-sdk-signer` + `@novasamatech/host-api`) is how the embedded dapp obtains accounts and requests signatures from the host (Polkadot Mobile, Desktop, or Web) over a postMessage transport; signing is approved on Polkadot Mobile (Desktop/Web relay to the paired phone); only works when embedded.
+- Host API (`@parity/product-sdk-signer` + `@parity/product-sdk-host`) is how the embedded dapp obtains accounts and requests signatures from the host (Polkadot Mobile, Desktop, or Web) over a postMessage transport; signing is approved on Polkadot Mobile (Desktop/Web relay to the paired phone); only works when embedded.
 - No browser/extension fallbacks — out-of-scope on purpose. Always go through `@parity/product-sdk-*` / the Host API; never reach a chain via direct full-node RPC.

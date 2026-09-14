@@ -1,18 +1,18 @@
 import { useState, useEffect } from "react";
 import {
-    createAccountsProvider,
-    preimageManager,
+    getAccountsProvider,
+    getHostProvider,
+    getPreimageManager,
     requestPermission,
-    createPapiProvider,
-    sandboxTransport,
+    type AccountsProvider,
     type ProductAccount,
-} from "@novasamatech/host-api-wrapper";
-import { RequestCredentialsErr } from "@novasamatech/host-api";
-import { ContractManager, ensureContractAccountMapped } from "@parity/product-sdk-contracts";
-import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
+    type HostSubscription,
+} from "@parity/product-sdk-host";
+import { ContractManager, QUERY_FALLBACK_ORIGIN, ensureContractAccountMapped } from "@parity/product-sdk-contracts";
+import type { devnet_asset_hub } from "@parity/product-sdk-descriptors/devnet-asset-hub";
+import type { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
 import { ss58ToH160 } from "@parity/product-sdk-address";
 import { createClient, AccountId, type PolkadotSigner } from "polkadot-api";
-import { getWsProvider } from "@polkadot-api/ws-provider";
 import { blake2b } from "@noble/hashes/blake2.js";
 import { CID } from "multiformats/cid";
 import * as raw from "multiformats/codecs/raw";
@@ -20,9 +20,69 @@ import type { MultihashDigest } from "multiformats/hashes/interface";
 
 const CONTRACT_KEY = "@example/surveys";
 
-// Paseo Next v2 — see @parity/product-sdk 0.4.0 CHANGELOG. v1 retired 2026-05-20.
-const PASEO_ASSET_HUB_GENESIS = "0x173cea9df45656cf612c8b8ece56e04e9a693c69cfaac47d3628dae735067af8" as const;
-const PASEO_ASSET_HUB_WS = "wss://paseo-asset-hub-next-rpc.polkadot.io";
+// ---------------------------------------------------------------------------
+// Networks. "paseo-next" is the Paseo Next v2 preview network (para 1500) —
+// that's what the CDM `paseo` preset targets, NOT the public Paseo testnet.
+// "devnet" is the public products devnet on the Paseo testnet Asset Hub
+// (para 1000), with the community-operated CDM registry (reference:
+// contract-dependency-manager PR #61). Build with VITE_NETWORK=devnet to
+// select it; the default stays paseo-next. Descriptors load dynamically so
+// each build ships a single metadata chunk, and the genesis always comes
+// from the descriptor so it tracks chain resets with the package.
+// ---------------------------------------------------------------------------
+
+type AssetHubDescriptor = typeof devnet_asset_hub | typeof paseo_asset_hub;
+
+interface NetworkConfig {
+    label: string;
+    /** CDM ContractRegistry address the contract resolves against. */
+    registry: string;
+    loadDescriptor(): Promise<AssetHubDescriptor>;
+}
+
+// `import.meta.env.VITE_NETWORK` is inlined as a literal at build time, so this
+// comparison folds and the unselected network's ~880 kB metadata chunk is
+// dropped from the bundle. Keep it a direct literal comparison — routing the
+// choice through a lookup table or a normalizing helper leaves both import()s
+// reachable, so the build emits both metadata chunks.
+export const NETWORK: NetworkConfig =
+    import.meta.env.VITE_NETWORK === "devnet"
+        ? {
+              label: "Devnet (Paseo testnet)",
+              registry: "0x59b0245778917af55224e5f8fb55f7f8d452619f",
+              loadDescriptor: async () =>
+                  (await import("@parity/product-sdk-descriptors/devnet-asset-hub")).devnet_asset_hub,
+          }
+        : {
+              label: "Paseo Next",
+              registry: "0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0",
+              loadDescriptor: async () =>
+                  (await import("@parity/product-sdk-descriptors/paseo-asset-hub")).paseo_asset_hub,
+          };
+
+// Dev only: a typo'd VITE_NETWORK silently falls back to paseo-next, so say so
+// while developing. Kept out of the selection above to preserve the fold.
+if (import.meta.env.DEV) {
+    const configured = import.meta.env.VITE_NETWORK;
+    if (configured && configured !== "devnet" && configured !== "paseo" && configured !== "paseo-next") {
+        console.warn(`[Network] Unknown VITE_NETWORK "${configured}", falling back to paseo-next`);
+    }
+}
+
+/**
+ * Unwrap a product-sdk `Result` to its value, re-throwing the `err` channel as
+ * an `Error`. Since product-sdk 0.18 fallible calls return `Result` instead of
+ * throwing; this bridges them back onto throw / try-catch control flow. Mirrors
+ * the CLI's `unwrapResult` (playground-cli #470).
+ */
+export function unwrapResult<T>(
+    result: { ok: true; value: T } | { ok: false; error: unknown },
+): T {
+    if (!result.ok) {
+        throw result.error instanceof Error ? result.error : new Error(String(result.error));
+    }
+    return result.value;
+}
 
 // ---------------------------------------------------------------------------
 // Permissions (RFC-0002)
@@ -34,11 +94,11 @@ async function ensurePermission(tag: "ChainSubmit" | "PreimageSubmit" | "Stateme
     if (_grantedPermissions.has(tag)) return;
     try {
         const result = await requestPermission({ tag, value: undefined });
-        if (result.isOk() && result.value) {
+        if (result.ok && result.value) {
             _grantedPermissions.add(tag);
             console.log(`[Permission] ${tag} granted`);
         } else {
-            console.warn(`[Permission] ${tag} denied`, result.isErr() ? result.error : "user rejected");
+            console.warn(`[Permission] ${tag} denied`, result.ok ? "user rejected" : result.error);
         }
     } catch (err) {
         console.warn(`[Permission] ${tag} request failed:`, err);
@@ -49,7 +109,14 @@ async function ensurePermission(tag: "ChainSubmit" | "PreimageSubmit" | "Stateme
 // Account flow — direct against product-sdk (matches t3rminal / RPS pattern).
 // ---------------------------------------------------------------------------
 
-const accountsProvider = createAccountsProvider(sandboxTransport);
+// Lazy: the provider handshakes with the host on first use and is null when
+// the app runs outside a host container.
+let _accountsProvider: AccountsProvider | null | undefined;
+async function getProvider(): Promise<AccountsProvider | null> {
+    if (_accountsProvider === undefined) _accountsProvider = await getAccountsProvider();
+    return _accountsProvider;
+}
+
 const accountIdCodec = AccountId();
 
 /**
@@ -114,32 +181,48 @@ export async function connectAccount(): Promise<void> {
         const [identifier, derivationIndex] = getAppAccountId();
         console.log(`[Account] Requesting product account ${identifier}#${derivationIndex}`);
 
-        const result = await accountsProvider.getProductAccount(identifier, derivationIndex);
+        const provider = await getProvider();
+        if (!provider) {
+            setState({
+                status: "error",
+                account: null,
+                error: "Host unavailable — open this app inside a Polkadot host.",
+            });
+            return;
+        }
+
+        const result = await provider.getProductAccount(identifier, derivationIndex);
         if (result.isErr()) {
-            if (result.error instanceof RequestCredentialsErr.NotConnected) {
+            // Errors arrive as truapi's CallErrorValue envelope: domain errors
+            // (e.g. NotConnected = not signed in) are wrapped as
+            // { tag: "Domain", value: { tag: "V1", value: <domain error> } }.
+            const error = result.error;
+            const domain = error.tag === "Domain" ? (error.value as any)?.value : null;
+            if (domain?.tag === "NotConnected") {
                 setState({ status: "signed-out", account: null });
                 return;
             }
-            const errMsg = `${(result.error as any)?.tag ?? "Unknown"}: ${(result.error as any)?.value?.reason ?? String(result.error)}`;
+            const errMsg = `${domain?.tag ?? error.tag}: ${domain?.value?.reason ?? (error as any)?.value?.reason ?? "request failed"}`;
             console.warn("[Account] getProductAccount error:", errMsg);
             setState({ status: "error", account: null, error: errMsg });
             return;
         }
 
-        const { publicKey } = result.value;
-        const productAccount: ProductAccount = { dotNsIdentifier: identifier, derivationIndex, publicKey };
-        // "createTransaction" signerType routes through the host's
-        // `host_create_transaction` RPC, the only path that signs Paseo Next v2's
-        // pallet-revive signed extensions (AsPgas, AsRingAlias, …).
-        const signer = accountsProvider.getProductAccountSigner(productAccount, "createTransaction");
+        // The provider returns the full product account (id + publicKey bytes).
+        const productAccount: ProductAccount = result.value;
+        const { publicKey } = productAccount;
+        // The signer routes through the host's `createTransaction` path, the only
+        // path that signs Paseo Next v2's pallet-revive signed extensions
+        // (AsPgas, AsRingAlias, …).
+        const signer = provider.getProductAccountSigner(productAccount);
         const ss58 = accountIdCodec.dec(publicKey);
         const h160Address = ss58ToH160(ss58 as never) as `0x${string}`;
 
         let displayName: string | null = null;
         try {
-            const userIdResult = await accountsProvider.getUserId();
+            const userIdResult = await provider.getUserId();
             if (userIdResult.isOk()) {
-                displayName = (userIdResult.value as any).primaryUsername ?? null;
+                displayName = userIdResult.value.primaryUsername ?? null;
             }
         } catch { /* optional */ }
 
@@ -169,9 +252,10 @@ export async function connectAccount(): Promise<void> {
     }
 }
 
-/** Open dotli's sign-in UI and refresh the account on success. */
+/** Open the host's sign-in UI and refresh the account on success. */
 export async function signIn(): Promise<void> {
-    await accountsProvider.requestLogin("Sign in to use Surveys");
+    const provider = await getProvider();
+    if (provider) await provider.requestLogin("Sign in to use Surveys");
     await connectAccount();
 }
 
@@ -213,6 +297,10 @@ export async function uploadToBulletin(bytes: Uint8Array): Promise<string> {
     await ensurePermission("PreimageSubmit");
     const cid = calculateCID(bytes);
     console.log("[Bulletin] Submitting preimage via host, size:", bytes.length, "expected CID:", cid);
+    const preimageManager = await getPreimageManager();
+    if (!preimageManager) {
+        throw new Error("Preimage manager unavailable — open this app inside a Polkadot host.");
+    }
     await preimageManager.submit(bytes);
     console.log("[Bulletin] Preimage stored.");
     return cid;
@@ -257,11 +345,15 @@ export async function wakeChainFollow(): Promise<void> {
 const NO_FOLLOW_RE = /no active follow/i;
 
 function withFollowRetry<T extends Record<string, any>>(method: T): T {
-    const wrap = <Fn extends (...a: any[]) => Promise<any>>(fn: Fn): Fn =>
+    const wrap = <Fn extends (...a: any[]) => Promise<any>>(fn: Fn, isTransaction: boolean): Fn =>
         (async (...args: any[]) => {
             await wakeChainFollow();
             try {
-                return await fn(...args);
+                const result = await fn(...args);
+                // SDK transaction failures are values; inspect them inside the
+                // retry boundary before getContract unwraps the final result.
+                if (isTransaction && result && result.ok === false) throw result.error;
+                return result;
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
                 if (!NO_FOLLOW_RE.test(msg)) throw err;
@@ -274,7 +366,7 @@ function withFollowRetry<T extends Record<string, any>>(method: T): T {
     return new Proxy(method, {
         get(target, prop) {
             const v = target[prop as keyof T];
-            if (typeof v === "function") return wrap(v.bind(target));
+            if (typeof v === "function") return wrap(v.bind(target), prop === "tx");
             return v;
         },
     });
@@ -298,19 +390,12 @@ async function ensureContractsReady(): Promise<void> {
     _contractInitPromise = (async () => {
         await ensurePermission("ChainSubmit");
 
-        // Asset Hub access:
-        //  - In dev (localhost) the host refuses to open a chain follow for the
-        //    unregistered domain, so `createPapiProvider` traps and the WS
-        //    fallback never fires. Bypass and go straight to WS.
-        //  - In a deployed `*.dot` app the host owns the follow; route through
-        //    `createPapiProvider` so signing/permissions stay coordinated.
-        const isDevHost =
-            typeof window !== "undefined" && /^localhost(:\d+)?$/.test(window.location.host);
-
-        const provider = isDevHost
-            ? getWsProvider(PASEO_ASSET_HUB_WS)
-            : createPapiProvider(PASEO_ASSET_HUB_GENESIS, getWsProvider(PASEO_ASSET_HUB_WS));
-        console.log(`[CDM] Asset Hub provider: ${isDevHost ? "direct WS (dev)" : "host with WS fallback (prod)"}`);
+        const descriptor = await NETWORK.loadDescriptor();
+        const genesis = descriptor.genesis as `0x${string}`;
+        const provider = await getHostProvider(genesis);
+        if (!provider) {
+            throw new Error("Asset Hub is unavailable — open this app inside a Polkadot host that supports the selected chain.");
+        }
         _polkadotClient = createClient(provider);
 
         console.log("[CDM] Waking Asset Hub chain follow...");
@@ -318,24 +403,57 @@ async function ensureContractsReady(): Promise<void> {
         await _polkadotClient.getBestBlocks();
         console.log("[CDM] Chain follow active.");
 
-        _contractManager = ContractManager.fromClient(
-            _cdmJson,
-            _polkadotClient,
-            paseo_asset_hub,
-            _state.account
-                ? { defaultOrigin: _state.account.address as never, defaultSigner: _state.account.signer }
-                : undefined,
-        );
+        const defaults = _state.account
+            ? { defaultOrigin: _state.account.address as never, defaultSigner: _state.account.signer }
+            : undefined;
+        if (NETWORK.registry.toLowerCase() !== String(_cdmJson?.registry ?? "").toLowerCase()) {
+            // The cdm.json snapshot was produced against a different network's
+            // registry, so its static address is meaningless here — resolve the
+            // contract address live from this network's registry instead.
+            // registryOrigin: the registry lookup is a pallet-revive dry-run and
+            // needs a MAPPED origin. The connected account may not be mapped yet
+            // (mapping happens later, on the submit path), so pin the lookup to
+            // the SDK's always-mapped pallet-account fallback instead of letting
+            // it default to defaultOrigin.
+            const live = await ContractManager.fromLiveClient(_cdmJson, _polkadotClient, descriptor, {
+                ...defaults,
+                registryAddress: NETWORK.registry as never,
+                registryOrigin: QUERY_FALLBACK_ORIGIN,
+            });
+            if (!live.ok) throw live.error;
+            _contractManager = live.value;
+        } else {
+            _contractManager = ContractManager.fromClient(_cdmJson, _polkadotClient, descriptor, defaults);
+        }
+        // Sign-in can finish while the live registry lookup is pending.
+        // Publish the current account defaults, not the pre-lookup snapshot.
+        if (_state.account) {
+            _contractManager.setDefaults({ origin: _state.account.address, signer: _state.account.signer });
+        }
         _contract = wrapContract(_contractManager.getContract(CONTRACT_KEY));
-        console.log("[CDM] Contract manager ready");
+        console.log(`[CDM] Contract manager ready (${NETWORK.label})`);
     })();
-    return _contractInitPromise;
+    try {
+        await _contractInitPromise;
+    } catch (error) {
+        _polkadotClient?.destroy();
+        _polkadotClient = null;
+        _contractManager = null;
+        _contract = null;
+        throw error;
+    } finally {
+        _contractInitPromise = null;
+    }
 }
 
 /**
  * Lazy contract handle. The chain client doesn't spin up until a method is
  * actually called. `getContract().method.query(...)` returns `{ success, value }`;
  * `.tx(...)` submits with the account defaults set on connect.
+ *
+ * Since product-sdk 0.18, `.tx(...)` returns a `Result` instead of throwing.
+ * Unwrap it here (re-throw the `err` channel) so the existing try/catch flow
+ * at every call site keeps working. `.query(...)` is unchanged upstream.
  */
 export function getContract(): any {
     if (!_cdmJson) return null;
@@ -349,7 +467,8 @@ export function getContract(): any {
                         if (!_contract) throw new Error("Contract init failed");
                         const real = _contract[prop as string];
                         if (!real) throw new Error(`Unknown method: ${String(prop)}`);
-                        return real[methodProp](...args);
+                        const outcome = await real[methodProp](...args);
+                        return methodProp === "tx" ? unwrapResult(outcome) : outcome;
                     };
                 },
             });
@@ -370,10 +489,16 @@ export async function ensureMapping(account: AppAccount): Promise<void> {
     await ensureContractsReady();
     if (!_contractManager) throw new Error("Contract manager not ready");
     try {
-        const mapped = await ensureContractAccountMapped(
-            _contractManager.getRuntime(),
-            account.address as never,
-            account.signer,
+        // Since product-sdk 0.18, ensureContractAccountMapped returns a Result
+        // (ok(null) = already mapped) instead of throwing. Unwrap it so the
+        // catch handles both a returned `err` and any thrown failure with the
+        // same cause-chain logging.
+        const mapped = unwrapResult(
+            await ensureContractAccountMapped(
+                _contractManager.getRuntime(),
+                account.address as never,
+                account.signer,
+            ),
         );
         if (mapped === null) {
             console.log(`[Revive] Account ${account.address} already mapped`);
@@ -383,46 +508,64 @@ export async function ensureMapping(account: AppAccount): Promise<void> {
         _mappedAccounts.add(account.address);
     } catch (err) {
         console.error("[Revive] ensureContractAccountMapped failed:", err);
-        if (err && typeof err === "object" && "cause" in err) {
-            console.error("[Revive] underlying cause:", (err as any).cause);
-        }
+        const cause = err && typeof err === "object" ? (err as { cause?: unknown }).cause : undefined;
+        if (cause) console.error("[Revive] underlying cause:", cause);
         throw err;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Bulletin reads via public IPFS gateways
+// Bulletin reads through the host preimage subscription
 // ---------------------------------------------------------------------------
 
-const GATEWAYS = [
-    "https://paseo-bulletin-next-ipfs.polkadot.io/ipfs/",
-    "https://dweb.link/ipfs/",
-    "https://ipfs.io/ipfs/",
-    "https://nftstorage.link/ipfs/",
-] as const;
-
-export const IPFS_GATEWAY = GATEWAYS[0];
-
-export async function fetchFromGateway(cid: string, timeoutMs = 30000): Promise<Uint8Array> {
-    const master = new AbortController();
-    const timer = setTimeout(() => master.abort(), timeoutMs);
-    try {
-        const winner = await Promise.any(
-            GATEWAYS.map(async gw => {
-                const resp = await fetch(gw + cid, { signal: master.signal });
-                if (!resp.ok) throw new Error(`${gw} -> ${resp.status}`);
-                return new Uint8Array(await resp.arrayBuffer());
-            }),
-        );
-        master.abort();
-        return winner;
-    } finally {
-        clearTimeout(timer);
+export async function fetchFromBulletin(cid: string, timeoutMs = 30000): Promise<Uint8Array> {
+    const parsed = CID.parse(cid);
+    // Survey uploads use raw blocks with a BLAKE2b-256 digest (calculateCID).
+    if (parsed.code !== raw.code || parsed.multihash.code !== BLAKE2B_256_CODE || parsed.multihash.size !== 32) {
+        throw new Error("Unsupported survey CID: expected a raw BLAKE2b-256 block.");
     }
+    const key = `0x${Array.from(parsed.multihash.digest, byte => byte.toString(16).padStart(2, "0")).join("")}` as `0x${string}`;
+    const manager = await getPreimageManager();
+    if (!manager) throw new Error("Bulletin storage is unavailable — open this app inside a Polkadot host.");
+
+    return new Promise((resolve, reject) => {
+        let done = false;
+        let subscription: HostSubscription | undefined;
+        let removeInterrupt: (() => void) | undefined;
+        const cleanup = () => {
+            clearTimeout(timer);
+            removeInterrupt?.();
+            subscription?.unsubscribe();
+        };
+        const fail = (error: unknown) => {
+            if (done) return;
+            done = true;
+            cleanup();
+            reject(error);
+        };
+        const timer = setTimeout(() => fail(new Error("Bulletin read timed out")), timeoutMs);
+        try {
+            subscription = manager.lookup(key, (bytes) => {
+                if (done || bytes === null) return;
+                if (calculateCID(bytes) !== parsed.toString()) {
+                    fail(new Error("Bulletin content does not match the requested CID"));
+                    return;
+                }
+                done = true;
+                cleanup();
+                resolve(bytes);
+            });
+            removeInterrupt = subscription.onInterrupt(() => fail(new Error("Bulletin host connection interrupted")));
+            // A host may return its cached preimage synchronously during setup.
+            if (done) cleanup();
+        } catch (error) {
+            fail(error);
+        }
+    });
 }
 
 export async function fetchJsonFromBulletin<T = unknown>(cid: string): Promise<T> {
-    const bytes = await fetchFromGateway(cid);
+    const bytes = await fetchFromBulletin(cid);
     return JSON.parse(new TextDecoder().decode(bytes)) as T;
 }
 
