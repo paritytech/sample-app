@@ -15,9 +15,19 @@ Decentralized survey application on Polkadot. Create surveys, collect responses,
 ## Setup
 
 ```bash
-npm install
+./setup.sh
 npm run dev
 ```
+
+Open the app inside a Polkadot host, including during localhost development.
+Chain reads and writes require that host to support the selected Asset Hub.
+Bulletin reads use host preimage subscriptions and validate the content against
+the raw BLAKE2b-256 CIDs produced by survey uploads. Host unavailability is
+reported; the app does not fall back to direct RPC or public storage gateways.
+
+Run `npm test` for isolated host-boundary regressions and `npm run build:frontend`
+for the TypeScript check and production build. These checks do not replace a
+real-host create/respond smoke test.
 
 > Deploying **your own copy** (own contract, own `.dot` name, published to the
 > playground)? Follow the step-by-step [DEPLOYMENT.md](./DEPLOYMENT.md).
